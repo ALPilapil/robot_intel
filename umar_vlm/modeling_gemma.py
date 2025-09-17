@@ -190,6 +190,8 @@ class GemmaMLP(nn.Module):
         # j = self.up_proj(x) # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
         # z = y * j # [Batch_Size, Seq_Len, Intermediate_Size]
         # z = self.down_proj(z) # [Batch_Size, Seq_Len, Intermediate_Size] -> [Batch_Size, Seq_Len, Hidden_Size]
+        # first apply gate projection which are learnable params, then do gelu on it. expand the whole thing into intermediate size
+        # then reduce it back into the original size
         return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -218,6 +220,13 @@ class GemmaAttention(nn.Module):
 
         assert self.hidden_size % self.num_heads == 0            
 
+        # num heads = 8
+        # hidden size = 1024
+        # head dim = 1024/8 = 128
+        # Wq: [1024, 8 * 128] = [1024, 1024]
+        # Wk: [1024, 1 * 128] = [1024, 128]
+        # Wv: [1024, 1 * 128] = [1024, 128]
+        # output is [hidden, hidden] = [1024, 1024]
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -236,7 +245,7 @@ class GemmaAttention(nn.Module):
         kv_cache: Optional[KVCache] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size]
+        bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size], remember prompt will be length of Q but Q is only 1 during generation
         # [Batch_Size, Seq_Len, Num_Heads_Q * Head_Dim]
         query_states = self.q_proj(hidden_states)
         # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
@@ -285,6 +294,7 @@ class GemmaAttention(nn.Module):
         # Concatenate all the heads together. [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q * Head_Dim]
         attn_output = attn_output.view(bsz, q_len, -1)
         # Multiply by W_o. [Batch_Size, Seq_Len_Q, Hidden_Size]
+        # mixes them all together
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights
@@ -320,14 +330,17 @@ class GemmaDecoderLayer(nn.Module):
             kv_cache=kv_cache,
         )
         # [Batch_Size, Seq_Len, Hidden_Size]
+        # skip connection
         hidden_states = residual + hidden_states
 
         # [Batch_Size, Seq_Len, Hidden_Size]
+        # another skip connection
         residual = hidden_states
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = self.post_attention_layernorm(hidden_states)
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = self.mlp(hidden_states)
+        # mlp is the feed forward network
         # [Batch_Size, Seq_Len, Hidden_Size]
         hidden_states = residual + hidden_states
 
@@ -365,6 +378,7 @@ class GemmaModel(nn.Module):
         hidden_states = hidden_states * normalizer
 
         for decoder_layer in self.layers:
+            # output of the last layer becomes the input of the next
             # [Batch_Size, Seq_Len, Hidden_Size]
             hidden_states = decoder_layer(
                 hidden_states,
@@ -387,6 +401,7 @@ class GemmaForCausalLM(nn.Module):
         self.model = GemmaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # this converts into logits
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -401,7 +416,7 @@ class GemmaForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple:
-
+        # just sends stuff to LM and applies linear layer
         # input_embeds: [Batch_Size, Seq_Len, Hidden_Size]
         # outputs: [Batch_Size, Seq_Len, Hidden_Size]
         outputs = self.model(
@@ -411,6 +426,7 @@ class GemmaForCausalLM(nn.Module):
             kv_cache=kv_cache,
         )
 
+        # take hidden states from outputs, apply LM head and return the logits
         hidden_states = outputs
         logits = self.lm_head(hidden_states)
         logits = logits.float()
@@ -429,6 +445,8 @@ class PaliGemmaMultiModalProjector(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
         super().__init__()
         self.linear = nn.Linear(config.vision_config.hidden_size, config.vision_config.projection_dim, bias=True)
+        # just a linear layer that converts the size of the hidden size of the vision model to the embed size of the text model
+        # just makes them match
 
     def forward(self, image_features):
         # [Batch_Size, Num_Patches, Embed_Dim] -> [Batch_Size, Num_Patches, Projection_Dim]
@@ -532,12 +550,14 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         if kv_cache is not None and kv_cache.num_items() > 0:
             # this deals with pre filling
             # The position of the query is just the last position
+            # [0, 1, 2 ... 255, 256, 257, 258] say there's 256 image tokens and 3 text tokens
             position_ids = attention_mask.cumsum(-1)[:, -1]
             if position_ids.dim() == 1:
                 position_ids = position_ids.unsqueeze(0)
         else:
             # Create a position_ids based on the size of the attention_mask
             # For masked tokens, use the number 1 as position.
+            # only one mask token generated during the generation phase
             position_ids = (attention_mask.cumsum(-1)).masked_fill_((attention_mask == 0), 1).to(device)
 
         return final_embedding, causal_mask, position_ids
