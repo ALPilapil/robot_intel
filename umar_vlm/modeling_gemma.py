@@ -588,10 +588,12 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # Merge the embeddings of the text tokens and the image tokens
         # NOTE: this already contains placeholders for where to put the image tokens
         # input_ids has the <img>
+        # dimensions: 
         inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(image_features, inputs_embeds, input_ids, attention_mask, kv_cache)
         
         # this is the output of the whole model
         # language model is taking the img features + prompt -> output
+        # dimensions: 
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
