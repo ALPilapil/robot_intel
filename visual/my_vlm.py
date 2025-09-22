@@ -168,8 +168,6 @@ class VLM(nn.Module):
         # get the dimension measurements of this
         batch_size, seq_len, embed_size = inputs_embeds.shape
         
-        print(f"embed size: {embed_size}")
-
         # scale the image features
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
 
@@ -208,22 +206,25 @@ class VLM(nn.Module):
         '''
         # get the input embdeddings from the input ids
         inputs_embeds = self.LanguageModel.model.embed_tokens(input_ids)
-        print(f"input embeds: {inputs_embeds}\ninput embeds shape: {inputs_embeds.shape}")
-        # VISUAL STUFF
-        # get image features from the pixel values which we will get from the processor
-        # [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embed_Dim]
-        selected_image_feature = self.VisionModel(pixel_values)
-        # [batch_size, patch_len, embed_dim]
-        last_hidden_state = selected_image_feature.last_hidden_state # extracts the actual tensor from the above variable
-        # [batch_size, embed_dim]
-        # pooled_output = selected_image_feature.pooler_output  # pooled CLS states, a single vector representation that summarizes entire input, this is what we want to use
 
-        # resize image ebeddings into language model embeddings dimensions
-        # make their embed dimensions match basically, but this is still the image vectors
-        image_features = self.multi_modal_projector(last_hidden_state)
+        if pixel_values is not None:
+            # applies only on the first pass
+            # VISUAL STUFF
+            # get image features from the pixel values which we will get from the processor
+            # [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embed_Dim]
+            selected_image_feature = self.VisionModel(pixel_values)
+            # [batch_size, patch_len, embed_dim]
+            last_hidden_state = selected_image_feature.last_hidden_state # extracts the actual tensor from the above variable
+            # [batch_size, embed_dim]
+            # pooled_output = selected_image_feature.pooler_output  # pooled CLS states, a single vector representation that summarizes entire input, this is what we want to use
 
-        # merge the embeddings of the text tokens and image tokens, remember that they are now the same embed dim
-        final_embeds = self._merge_input_ids_with_image_features(inputs_embeds=inputs_embeds, image_features=image_features, input_ids=input_ids)
+            # resize image ebeddings into language model embeddings dimensions
+            # make their embed dimensions match basically, but this is still the image vectors
+            image_features = self.multi_modal_projector(last_hidden_state)
+            # merge the embeddings of the text tokens and image tokens, remember that they are now the same embed dim
+            final_embeds = self._merge_input_ids_with_image_features(inputs_embeds=inputs_embeds, image_features=image_features, input_ids=input_ids)
+        else:
+            final_embeds = inputs_embeds
 
         # pass everything into the model
         outputs = self.LanguageModel(
@@ -236,8 +237,58 @@ class VLM(nn.Module):
 
         return outputs
     
-    
+    def generate(self, input_ids, pixel_values, attention_mask, max_length=50):
+        '''
+        a generation loop that stops once we hit the max length or the end of sequence token
+        a series of multiple forward passes that uses the past key values to improve efficiency
+        should be able to call it just like vlm.generate
+        inputs: processed input ids and pixel values
+        '''
+        generated_ids = input_ids.clone()
+        current_attention_mask = attention_mask.clone()
+        past_key_values = None
 
+        for step in range(max_length):
+            # first step should be the prefilling stage, process everything
+            if step == 0:
+                outputs = self.forward(input_ids=input_ids, 
+                                       attention_mask=attention_mask, 
+                                       pixel_values=pixel_values,
+                                       use_cache=True)
+            else:
+                # update the attention mask
+                new_token_mask = torch.ones(
+                (current_attention_mask.shape[0], 1), 
+                dtype=current_attention_mask.dtype,
+                device=current_attention_mask.device)
+
+                current_attention_mask = torch.cat([current_attention_mask, new_token_mask], dim=1)
+                
+                outputs = self.forward(input_ids=next_token_id, 
+                                       attention_mask=current_attention_mask, 
+                                       pixel_values=None,
+                                       past_key_values=past_key_values,
+                                       use_cache=True)
+            # use the last key values
+            past_key_values = outputs.past_key_values
+            # get the logits
+            logits = outputs.logits # [batch size, seq len, vocab size (resized already)]
+            # need only the one corresponding to the last in the sequence
+            last_token_logits = logits[:, -1, :]
+            # apply softmax
+            probabilities = torch.softmax(last_token_logits, -1)
+            next_token_id = torch.multinomial(probabilities, num_samples=1)
+            generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
+
+
+            if next_token_id.item() == self.TextTokenizer.eos_token_id:
+                break
+
+        # decode the response
+        list_ver_ids = generated_ids.squeeze().tolist()
+        response = self.TextTokenizer.decode(list_ver_ids)
+        
+        return response
 
 def main():
     # vision_encoder()
@@ -247,10 +298,10 @@ def main():
     tokenizer  = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     visual_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
     LanguageModel=AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    VisionModel = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
-
+    VisionModel = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")\
+    
     # TESTING OUTPUTS
-    prompt = "this is a test"
+    prompt = "describe what a cat is please"
     image = Image.open("./images/laundry.webp")
 
     # process prompt and image
@@ -266,9 +317,8 @@ def main():
     vlm = VLM(my_vlm_config)
 
     # test the vlm
-    outputs = vlm(input_ids=processed['input_ids'], pixel_values=processed['pixel_values'], attention_mask=processed['attention_mask'])
-    print(f"outputs: {outputs}")
-
+    response = vlm.generate(input_ids=processed['input_ids'], pixel_values=processed['pixel_values'], attention_mask=processed['attention_mask'])
+    print(response)
 
 if __name__ == "__main__":
     main()
