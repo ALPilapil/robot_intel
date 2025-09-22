@@ -510,7 +510,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         image_mask_expanded = image_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
 
         # Add the text embeddings
-        # this says: whereever the condition of x is true, it will take input from y, ottherwise it will take from z
+        # this says: wherever the condition of x is true, it will take input from y, ottherwise it will take from z
         # wherever the text mask is 1 we copy embed from input embeds
         final_embedding = torch.where(text_mask_expanded, inputs_embeds, final_embedding)
         # Insert image embeddings. We can't use torch.where because the sequence length of scaled_image_features is not equal to the sequence length of the final embedding
@@ -588,12 +588,10 @@ class PaliGemmaForConditionalGeneration(nn.Module):
         # Merge the embeddings of the text tokens and the image tokens
         # NOTE: this already contains placeholders for where to put the image tokens
         # input_ids has the <img>
-        # dimensions: 
         inputs_embeds, attention_mask, position_ids = self._merge_input_ids_with_image_features(image_features, inputs_embeds, input_ids, attention_mask, kv_cache)
         
         # this is the output of the whole model
         # language model is taking the img features + prompt -> output
-        # dimensions: 
         outputs = self.language_model(
             attention_mask=attention_mask,
             position_ids=position_ids,

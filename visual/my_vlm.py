@@ -4,6 +4,9 @@ import torch
 from torch import nn
 from transformers import AutoProcessor, CLIPVisionModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from typing import Optional, Tuple, List
+# custom
+from vlm_processor import VLMProcessor
 
 
 def vision_encoder():
@@ -15,21 +18,24 @@ def vision_encoder():
     print(f"Model config: {model.config}")
     print(f"Hidden size: {model.config.hidden_size}")
     print(f"model: {type(model)}")
+    # print(f"processor: {processor}")
+    print(f"model dir: {dir(model)}")
+    print(f"model size: {model.vision_model.embeddings.position_embedding.weight.shape}")
 
-    # url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-    # image = Image.open(requests.get(url, stream=True).raw)
+    url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+    image = Image.open(requests.get(url, stream=True).raw)
 
-    # # processor takes an image and returns the pixel values in [batch_size, channels, height, width]
-    # inputs = processor(images=image, return_tensors="pt") 
-    # # image can be a list or just one, batch size will match this
-    # print(f"inputs type: {type(inputs['pixel_values'])} \n inputs: {inputs['pixel_values'].shape}")
+    # processor takes an image and returns the pixel values in [batch_size, channels, height, width]
+    inputs = processor(images=image, return_tensors="pt") 
+    # image can be a list or just one, batch size will match this
+    print(f"inputs type: {type(inputs['pixel_values'])} \n inputs: {inputs['pixel_values'].shape}")
 
-    # outputs = model(**inputs) # of type transformer class, ** unpacks it, essentially doing what's done above in the with the dict
-    # last_hidden_state = outputs.last_hidden_state # extracts the actual tensor from the above variable
-    # pooled_output = outputs.pooler_output  # pooled CLS states, a single vector representation that summarizes entire input, this is what we want to use
+    outputs = model(**inputs) # of type transformer class, ** unpacks it, essentially doing what's done above in the with the dict
+    last_hidden_state = outputs.last_hidden_state # extracts the actual tensor from the above variable
+    pooled_output = outputs.pooler_output  # pooled CLS states, a single vector representation that summarizes entire input, this is what we want to use
 
-    # print(f"last_hidden_state shape: {last_hidden_state.shape}") # [batch size, seq length, embed dim], batch size is how many images are passed through, seq length = how many chunks image is divided into 
-    # print(f"pooled_output shape: {pooled_output.shape}") # [batch size, embed dim]
+    print(f"last_hidden_state shape: {last_hidden_state.shape}") # [batch size, seq length, embed dim], batch size is how many images are passed through, seq length = how many chunks image is divided into 
+    print(f"pooled_output shape: {pooled_output.shape}") # [batch size, embed dim]
 
 # TEXT MODEL
 def llamma():
@@ -97,13 +103,15 @@ def llamma():
     generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
     print(f"gnerated text: {generated_text}")
     print(f"outputs: {outputs}")
-        
+
+
         
 #----------------- SUB CLASSES -----------------#
 class VLMConfig():
-    def __init__(self, VisionModel=CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32"),
-                 LanguageModel=AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0"),
-                 text_tokenizer=AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0"),
+    def __init__(self, VisionModel,
+                 LanguageModel,
+                 text_tokenizer,
+                 image_token_index=32000,
                  pad_token_id=None):
         self.VisionModel = VisionModel
         self.LanguageModel = LanguageModel
@@ -111,6 +119,11 @@ class VLMConfig():
         self.vision_config = VisionModel.config
         self.text_config = LanguageModel.config
         self.pad_token_id = pad_token_id
+        self.image_token_index = image_token_index
+        if (VisionModel.config.hidden_size >= LanguageModel.config.hidden_size):
+            self.hidden_size = VisionModel.config.hidden_size
+        else:
+            self.hidden_size = LanguageModel.config.hidden_size
 
 class MultiModalProjector(nn.Module):
     def __init__(self, config: VLMConfig):
@@ -138,60 +151,123 @@ class VLM(nn.Module):
         # set the padding token
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
 
-    # def _merge_input_ids_with_image_features(
-    #         self, image_features, 
-    # ):
-    #     '''
-    #     returns
-    #     '''
+    def _merge_input_ids_with_image_features(
+            self, 
+            inputs_embeds, # placeholder image + bos + prompt + \n 
+            image_features, # actual image
+            input_ids
+    ):
+        '''
+        returns a final embedding that is a combination of the vectors from the image
+        and the ones from the prompt. 
+        do this by making a tensor of the final shape, make masks of each component, sub these
+        into this placeholder tensor as the final tensor
+        a causal mask
+        position ids, 12345...
+        '''
+        # get the dimension measurements of this
+        batch_size, seq_len, embed_size = inputs_embeds.shape
+        
+        print(f"embed size: {embed_size}")
+
+        # scale the image features
+        scaled_image_features = image_features / (self.config.hidden_size**0.5)
+
+        # "placeholder" final tensor in the same shape as the input
+        zero_final_embeddings = torch.zeros_like(inputs_embeds)
+
+        # make masks from the input ids
+        text_mask = input_ids != self.config.image_token_index
+        visual_mask = input_ids == self.config.image_token_index
+
+        # expand the masks to match the dimensions of the visual features and final embed
+        text_mask = text_mask.unsqueeze(-1).expand(-1, -1, embed_size)
+        visual_mask = visual_mask.unsqueeze(-1).expand(-1, -1, embed_size)
+
+        # replace the final_embeddings vector with the appropriate values using these masks
+        final_embeddings = torch.where(text_mask, inputs_embeds, zero_final_embeddings)
+        final_embeddings = final_embeddings.masked_scatter(visual_mask, scaled_image_features)
+
+        # make positional ids
+        # positional_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)  # [batch_size, seq_len]
+
+        return final_embeddings
+
 
     def forward(
             self,
-            input_ids, # extracted from the <image> + <bos> + prompt + \n
-            pixel_values, # we will get this from the processor
+            input_ids, # extracted from the <image> + <bos> + prompt + \n, a tensor of inpud ids
+            attention_mask, # the tokenizer needs this in order to tokenize properly
+            pixel_values, # we will get this from the processor that also gives us input ids above
+            past_key_values=None, # this will act as our KV Cache basically
+            use_cache=False,
     ):
-        # we already have models that return the vectors we need, all we have to do is merge them
-        # with a multi modal projector and a merge input ids with image features
-
+        '''
+        inputs: input_ids (a tensor of the input ids), pixel_values (from the processor)
+        outputs: response to the image = prompt
+        '''
+        # get the input embdeddings from the input ids
+        inputs_embeds = self.LanguageModel.model.embed_tokens(input_ids)
+        print(f"input embeds: {inputs_embeds}\ninput embeds shape: {inputs_embeds.shape}")
+        # VISUAL STUFF
         # get image features from the pixel values which we will get from the processor
         # [Batch_Size, Channels, Height, Width] -> [Batch_Size, Num_Patches, Embed_Dim]
         selected_image_feature = self.VisionModel(pixel_values)
         # [batch_size, patch_len, embed_dim]
         last_hidden_state = selected_image_feature.last_hidden_state # extracts the actual tensor from the above variable
         # [batch_size, embed_dim]
-        pooled_output = selected_image_feature.pooler_output  # pooled CLS states, a single vector representation that summarizes entire input, this is what we want to use
+        # pooled_output = selected_image_feature.pooler_output  # pooled CLS states, a single vector representation that summarizes entire input, this is what we want to use
+
         # resize image ebeddings into language model embeddings dimensions
         # make their embed dimensions match basically, but this is still the image vectors
-        image_features = self.multi_modal_projector(selected_image_feature)
-        # merge the embeddings of the text tokens and image tokens, need to figure out what inputs to give it
-        
+        image_features = self.multi_modal_projector(last_hidden_state)
 
-        return 
+        # merge the embeddings of the text tokens and image tokens, remember that they are now the same embed dim
+        final_embeds = self._merge_input_ids_with_image_features(inputs_embeds=inputs_embeds, image_features=image_features, input_ids=input_ids)
 
+        # pass everything into the model
+        outputs = self.LanguageModel(
+            attention_mask=attention_mask,
+            inputs_embeds=final_embeds,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            return_dict=True
+        )
+
+        return outputs
+    
+    
 
 
 def main():
-    # SO FAR:
-    # a text decoder and visual encoder that are of different dimensions
-    # vision: 768    text: 2048
-    # note that both are [batch, seq_len, embed_dim]
-
-    # TODO:
-    # MultiModalProjector
-    # tie weights
-    # merge input ids with image features
-    # - returns inputs_embeds, attention_mask, position_ids
-    # language model needs to be constructed in a way to take these inputs
-
     # vision_encoder()
-    llamma()
-    # my_vlm_config = VLMConfig()
-    # vlm = VLM(my_vlm_config)
-    # print(f"vlm vision model config: {vlm.VisionModel.config}")
-    # print(f"vlm text model config: {vlm.LanguageModel.config}")
+    # llamma()
 
+    # COMPONENTS
+    tokenizer  = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    visual_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    LanguageModel=AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    VisionModel = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
 
+    # TESTING OUTPUTS
+    prompt = "this is a test"
+    image = Image.open("./images/laundry.webp")
 
+    # process prompt and image
+    processor = VLMProcessor(tokenizer, VisionModel, visual_processor)
+    processed = processor(prompt, image)
+    # processed contains pixel values, input ids, attention mask
+
+    # make VLM, config defined by above components
+    LanguageModel.resize_token_embeddings(len(tokenizer))  # resize to account for new vocab added
+    my_vlm_config = VLMConfig(VisionModel=VisionModel, LanguageModel=LanguageModel, text_tokenizer=tokenizer) 
+    
+    # need to pass this tokenizer back in now that it's been modified with new vocab for the processor
+    vlm = VLM(my_vlm_config)
+
+    # test the vlm
+    outputs = vlm(input_ids=processed['input_ids'], pixel_values=processed['pixel_values'], attention_mask=processed['attention_mask'])
+    print(f"outputs: {outputs}")
 
 
 if __name__ == "__main__":
