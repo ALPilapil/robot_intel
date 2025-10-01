@@ -111,19 +111,47 @@ class VLMConfig():
     def __init__(self, VisionModel,
                  LanguageModel,
                  text_tokenizer,
-                 image_token_index=32000,
-                 pad_token_id=None):
+                 image_token_index=32000
+                 ):
         self.VisionModel = VisionModel
         self.LanguageModel = LanguageModel
         self.TextTokenizer = text_tokenizer
         self.vision_config = VisionModel.config
         self.text_config = LanguageModel.config
-        self.pad_token_id = pad_token_id
+        self.pad_token_id = text_tokenizer.pad_token_id
         self.image_token_index = image_token_index
+        self.criterion = nn.CrossEntropyLoss()
+        self._name_or_path = "VLM"
+        self._attn_implementation = self.LanguageModel.config._attn_implementation
+        self.eos_token_id = text_tokenizer.eos_token_id
+        self.bos_token_id = text_tokenizer.bos_token_id
+        self.gradient_checkpointing = False
+        self.tie_word_embeddings = False
         if (VisionModel.config.hidden_size >= LanguageModel.config.hidden_size):
             self.hidden_size = VisionModel.config.hidden_size
         else:
             self.hidden_size = LanguageModel.config.hidden_size
+
+    def get(self, key, default=None):
+        """Make config dict-like for PEFT compatibility"""
+        return getattr(self, key, default)
+    
+    def to_dict(self):
+        """Convert config to dictionary"""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+    def to_json_string(self):
+        """Convert config to JSON string for saving"""
+        import json
+        # Filter out non-serializable objects (models, tokenizers)
+        serializable_dict = {}
+        for k, v in self.__dict__.items():
+            if not k.startswith('_'):
+                # Skip non-serializable objects
+                if k in ['VisionModel', 'LanguageModel', 'TextTokenizer', 'criterion', 'vision_config', 'text_config']:
+                    continue
+                serializable_dict[k] = v
+        return json.dumps(serializable_dict, indent=2)
 
 class MultiModalProjector(nn.Module):
     def __init__(self, config: VLMConfig):
@@ -143,13 +171,29 @@ class VLM(nn.Module):
         self.config = config
         # create an instance of the vision encoder
         self.VisionModel = config.VisionModel
-        # creat an instance of the language model and tokenizer
+        # create an instance of the language model and tokenizer
         self.LanguageModel = config.LanguageModel
         self.TextTokenizer = config.TextTokenizer
         # multi modal projector 
         self.multi_modal_projector = MultiModalProjector(config)
         # set the padding token
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        self.gradient_checkpointing = config.gradient_checkpointing
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        self.gradient_checkpointing = True
+        # Enable it for submodules if needed
+        if hasattr(self.VisionModel, 'gradient_checkpointing_enable'):
+            self.VisionModel.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+        if hasattr(self.LanguageModel, 'gradient_checkpointing_enable'):
+            self.LanguageModel.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+    
+    def gradient_checkpointing_disable(self, gradient_checkpointing_kwargs=None):
+        self.gradient_checkpointing = False
+        if hasattr(self.VisionModel, 'gradient_checkpointing_disable'):
+            self.VisionModel.gradient_checkpointing_disable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
+        if hasattr(self.LanguageModel, 'gradient_checkpointing_disable'):
+            self.LanguageModel.gradient_checkpointing_disable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)
 
     def _merge_input_ids_with_image_features(
             self, 
@@ -191,14 +235,14 @@ class VLM(nn.Module):
 
         return final_embeddings
 
-
     def forward(
             self,
-            input_ids, # extracted from the <image> + <bos> + prompt + \n, a tensor of inpud ids
+            input_ids, # extracted from the <image> + <bos> + prompt + \n, a tensor of input ids, or is the next word
             attention_mask, # the tokenizer needs this in order to tokenize properly
             pixel_values, # we will get this from the processor that also gives us input ids above
             past_key_values=None, # this will act as our KV Cache basically
             use_cache=False,
+            labels=None  # this makes it compatible with the trainer API
     ):
         '''
         inputs: input_ids (a tensor of the input ids), pixel_values (from the processor)
@@ -215,9 +259,6 @@ class VLM(nn.Module):
             selected_image_feature = self.VisionModel(pixel_values)
             # [batch_size, patch_len, embed_dim]
             last_hidden_state = selected_image_feature.last_hidden_state # extracts the actual tensor from the above variable
-            # [batch_size, embed_dim]
-            # pooled_output = selected_image_feature.pooler_output  # pooled CLS states, a single vector representation that summarizes entire input, this is what we want to use
-
             # resize image ebeddings into language model embeddings dimensions
             # make their embed dimensions match basically, but this is still the image vectors
             image_features = self.multi_modal_projector(last_hidden_state)
@@ -226,16 +267,17 @@ class VLM(nn.Module):
         else:
             final_embeds = inputs_embeds
 
-        # pass everything into the model
+        # Pass everything into the model (labels included)
         outputs = self.LanguageModel(
             attention_mask=attention_mask,
             inputs_embeds=final_embeds,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            labels=labels,  # Always pass labels
             return_dict=True
         )
 
-        return outputs
+        return outputs  # Return the outputs object directly
     
     def generate(self, input_ids, pixel_values, attention_mask, max_length=50):
         '''
@@ -244,49 +286,50 @@ class VLM(nn.Module):
         should be able to call it just like vlm.generate
         inputs: processed input ids and pixel values
         '''
-        generated_ids = input_ids.clone()
-        current_attention_mask = attention_mask.clone()
-        past_key_values = None
+        with torch.no_grad():
+            generated_ids = input_ids.clone()
+            current_attention_mask = attention_mask.clone()
+            past_key_values = None
 
-        for step in range(max_length):
-            # first step should be the prefilling stage, process everything
-            if step == 0:
-                outputs = self.forward(input_ids=input_ids, 
-                                       attention_mask=attention_mask, 
-                                       pixel_values=pixel_values,
-                                       use_cache=True)
-            else:
-                # update the attention mask
-                new_token_mask = torch.ones(
-                (current_attention_mask.shape[0], 1), 
-                dtype=current_attention_mask.dtype,
-                device=current_attention_mask.device)
+            for step in range(max_length):
+                # first step should be the prefilling stage, process everything
+                if step == 0:
+                    outputs = self.forward(input_ids=input_ids, 
+                                        attention_mask=attention_mask, 
+                                        pixel_values=pixel_values,
+                                        use_cache=True)
+                else:
+                    # update the attention mask
+                    new_token_mask = torch.ones(
+                    (current_attention_mask.shape[0], 1), 
+                    dtype=current_attention_mask.dtype,
+                    device=current_attention_mask.device)
 
-                current_attention_mask = torch.cat([current_attention_mask, new_token_mask], dim=1)
-                
-                outputs = self.forward(input_ids=next_token_id, 
-                                       attention_mask=current_attention_mask, 
-                                       pixel_values=None,
-                                       past_key_values=past_key_values,
-                                       use_cache=True)
-            # use the last key values
-            past_key_values = outputs.past_key_values
-            # get the logits
-            logits = outputs.logits # [batch size, seq len, vocab size (resized already)]
-            # need only the one corresponding to the last in the sequence
-            last_token_logits = logits[:, -1, :]
-            # apply softmax
-            probabilities = torch.softmax(last_token_logits, -1)
-            next_token_id = torch.multinomial(probabilities, num_samples=1)
-            generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
+                    current_attention_mask = torch.cat([current_attention_mask, new_token_mask], dim=1)
+                    
+                    outputs = self.forward(input_ids=next_token_id, 
+                                        attention_mask=current_attention_mask, 
+                                        pixel_values=None,
+                                        past_key_values=past_key_values,
+                                        use_cache=True)
+                # use the last key values
+                past_key_values = outputs.past_key_values
+                # get the logits
+                logits = outputs.logits # [batch size, seq len, vocab size (resized already)]
+                # need only the one corresponding to the last in the sequence
+                last_token_logits = logits[:, -1, :]
+                # apply softmax
+                probabilities = torch.softmax(last_token_logits, -1)
+                next_token_id = torch.multinomial(probabilities, num_samples=1)
+                generated_ids = torch.cat([generated_ids, next_token_id], dim=-1)
 
 
-            if next_token_id.item() == self.TextTokenizer.eos_token_id:
-                break
+                if next_token_id.item() == self.TextTokenizer.eos_token_id:
+                    break
 
-        # decode the response
-        list_ver_ids = generated_ids.squeeze().tolist()
-        response = self.TextTokenizer.decode(list_ver_ids)
+            # decode the response
+            list_ver_ids = generated_ids.squeeze().tolist()
+            response = self.TextTokenizer.decode(list_ver_ids)
         
         return response
 
@@ -298,17 +341,11 @@ def main():
     tokenizer  = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     visual_processor = AutoProcessor.from_pretrained("openai/clip-vit-base-patch32")
     LanguageModel=AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    VisionModel = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")\
-    
-    # TESTING OUTPUTS
-    prompt = "describe what a cat is please"
-    image = Image.open("./images/laundry.webp")
+    VisionModel = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
 
-    # process prompt and image
+    # processor must come BEFORE the VLM Config because it modifies the tokenizer in place
     processor = VLMProcessor(tokenizer, VisionModel, visual_processor)
-    processed = processor(prompt, image)
-    # processed contains pixel values, input ids, attention mask
-
+    
     # make VLM, config defined by above components
     LanguageModel.resize_token_embeddings(len(tokenizer))  # resize to account for new vocab added
     my_vlm_config = VLMConfig(VisionModel=VisionModel, LanguageModel=LanguageModel, text_tokenizer=tokenizer) 
@@ -316,9 +353,47 @@ def main():
     # need to pass this tokenizer back in now that it's been modified with new vocab for the processor
     vlm = VLM(my_vlm_config)
 
-    # test the vlm
-    response = vlm.generate(input_ids=processed['input_ids'], pixel_values=processed['pixel_values'], attention_mask=processed['attention_mask'])
-    print(response)
 
-if __name__ == "__main__":
-    main()
+    # TESTING OUTPUTS
+    # prompt = "describe what a cat is"
+    # target_response = "A cat is a small carnivorous mammal."
+    # image = Image.open("./images/laundry.webp")
+    
+    # # Option 1: Process full conversation at once
+    # full_text = f"{prompt} {target_response}"
+    # processed_full = processor(full_text, image)
+    
+    # # Create labels: mask the prompt, predict the response
+    # labels = processed_full['input_ids'].clone()
+    
+    # # Find where the response starts (after the prompt)
+    # prompt_only = processor(prompt, image)
+    # prompt_length = prompt_only['input_ids'].shape[1]
+    
+    # # Mask everything up to the response
+    # labels[:, :prompt_length] = -100
+    
+    # # Also mask image tokens specifically
+    # image_token_mask = (labels == 32000)  # Your image token index
+    # labels[image_token_mask] = -100
+    
+    # print(f"Full input_ids shape: {processed_full['input_ids'].shape}")
+    # print(f"Labels shape: {labels.shape}")
+    # print(f"Input IDs: {processed_full['input_ids']}")
+    # print(f"Labels: {labels}")
+    # print(f"Prompt length: {prompt_length}")
+    
+    # # Now they match perfectly!
+    # outputs = vlm(
+    #     input_ids=processed_full['input_ids'], 
+    #     pixel_values=processed_full['pixel_values'], 
+    #     attention_mask=processed_full['attention_mask'], 
+    #     labels=labels
+    # )
+    
+    # print(f"Loss: {outputs['loss']}")
+    # response = vlm.generate(input_ids=processed['input_ids'], pixel_values=processed['pixel_values'], attention_mask=processed['attention_mask'])
+    # print(response)
+
+# if __name__ == "__main__":
+#     main()

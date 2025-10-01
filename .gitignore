@@ -1,4 +1,2 @@
-# ignore images
-images/
-
+# ignore pycache
 __pycache__/
