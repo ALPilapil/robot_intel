@@ -112,33 +112,36 @@ class VLMConfig(PretrainedConfig):
 
     model_type = "vlm"
 
-    def __init__(self, VisionModel,
-                 LanguageModel,
-                 text_tokenizer,
+    def __init__(self, 
+                 VisionModel=None,
+                 LanguageModel=None,
+                 TextTokenizer=None,
                  image_token_index=32000,
+                 pad_token_id=32002,
+                 eos_token_id=2,
+                 bos_token_id=1,
                  **kwargs):
         
         super().__init__(**kwargs)
 
-        self.VisionModel = VisionModel
-        self.LanguageModel = LanguageModel
-        self.TextTokenizer = text_tokenizer
-        self.vision_config = VisionModel.config
-        self.text_config = LanguageModel.config
-        self.pad_token_id = text_tokenizer.pad_token_id
+        if VisionModel is not None:
+            self.vision_config = VisionModel.config
+            if (VisionModel.config.hidden_size >= LanguageModel.config.hidden_size):
+                self.hidden_size = VisionModel.config.hidden_size
+            else:
+                self.hidden_size = LanguageModel.config.hidden_size
+        if LanguageModel is not None:
+            self.text_config = LanguageModel.config
+        if TextTokenizer is not None:
+            self.pad_token_id = TextTokenizer.pad_token_id
+            self.eos_token_id = TextTokenizer.eos_token_id
+            self.bos_token_id = TextTokenizer.bos_token_id
         self.image_token_index = image_token_index
-        self.criterion = nn.CrossEntropyLoss()
         self._name_or_path = "VLM"
         self._attn_implementation = "eager"
-        self.eos_token_id = text_tokenizer.eos_token_id
-        self.bos_token_id = text_tokenizer.bos_token_id
         self.gradient_checkpointing = False
         self.tie_word_embeddings = False
         self.blah_blah = "blah blah"
-        if (VisionModel.config.hidden_size >= LanguageModel.config.hidden_size):
-            self.hidden_size = VisionModel.config.hidden_size
-        else:
-            self.hidden_size = LanguageModel.config.hidden_size
 
 class MultiModalProjector(nn.Module):
     def __init__(self, config: VLMConfig):
@@ -155,14 +158,18 @@ class MultiModalProjector(nn.Module):
 class VLM(PreTrainedModel):
     config_class = VLMConfig
 
-    def __init__(self, config: VLMConfig):
+    def __init__(self, 
+                 config: VLMConfig,
+                 VisionModel=None,
+                 LanguageModel=None,
+                 TextTokenizer=None):
         super().__init__(config)
         self.config = config
         # create an instance of the vision encoder
-        self.VisionModel = config.VisionModel
+        self.VisionModel = VisionModel
         # create an instance of the language model and tokenizer
-        self.LanguageModel = config.LanguageModel
-        self.TextTokenizer = config.TextTokenizer
+        self.LanguageModel = LanguageModel
+        self.TextTokenizer = TextTokenizer
         # multi modal projector 
         self.multi_modal_projector = MultiModalProjector(config)
         # set the padding token
@@ -355,10 +362,10 @@ def main():
     
     # make VLM, config defined by above components
     LanguageModel.resize_token_embeddings(len(tokenizer))  # resize to account for new vocab added
-    my_vlm_config = VLMConfig(VisionModel=VisionModel, LanguageModel=LanguageModel, text_tokenizer=tokenizer) 
+    my_vlm_config = VLMConfig(VisionModel=VisionModel, LanguageModel=LanguageModel, TextTokenizer=tokenizer) 
     
     # need to pass this tokenizer back in now that it's been modified with new vocab for the processor
-    vlm = VLM(my_vlm_config)
+    vlm = VLM(my_vlm_config, VisionModel=VisionModel, LanguageModel=LanguageModel, TextTokenizer=tokenizer)
 
 
     # TESTING OUTPUTS

@@ -1,2 +1,6 @@
 # ignore pycache
 __pycache__/
+
+# ignore temp files
+temp.py
+vlm_training_output/
