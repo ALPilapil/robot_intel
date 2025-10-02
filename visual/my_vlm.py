@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from transformers import AutoProcessor, CLIPVisionModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import PretrainedConfig, PreTrainedModel
 from typing import Optional, Tuple, List
 # custom
 from vlm_processor import VLMProcessor
@@ -107,12 +108,18 @@ def llamma():
 
         
 #----------------- SUB CLASSES -----------------#
-class VLMConfig():
+class VLMConfig(PretrainedConfig):
+
+    model_type = "vlm"
+
     def __init__(self, VisionModel,
                  LanguageModel,
                  text_tokenizer,
-                 image_token_index=32000
-                 ):
+                 image_token_index=32000,
+                 **kwargs):
+        
+        super().__init__(**kwargs)
+
         self.VisionModel = VisionModel
         self.LanguageModel = LanguageModel
         self.TextTokenizer = text_tokenizer
@@ -122,36 +129,16 @@ class VLMConfig():
         self.image_token_index = image_token_index
         self.criterion = nn.CrossEntropyLoss()
         self._name_or_path = "VLM"
-        self._attn_implementation = self.LanguageModel.config._attn_implementation
+        self._attn_implementation = "eager"
         self.eos_token_id = text_tokenizer.eos_token_id
         self.bos_token_id = text_tokenizer.bos_token_id
         self.gradient_checkpointing = False
         self.tie_word_embeddings = False
+        self.blah_blah = "blah blah"
         if (VisionModel.config.hidden_size >= LanguageModel.config.hidden_size):
             self.hidden_size = VisionModel.config.hidden_size
         else:
             self.hidden_size = LanguageModel.config.hidden_size
-
-    def get(self, key, default=None):
-        """Make config dict-like for PEFT compatibility"""
-        return getattr(self, key, default)
-    
-    def to_dict(self):
-        """Convert config to dictionary"""
-        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
-
-    def to_json_string(self):
-        """Convert config to JSON string for saving"""
-        import json
-        # Filter out non-serializable objects (models, tokenizers)
-        serializable_dict = {}
-        for k, v in self.__dict__.items():
-            if not k.startswith('_'):
-                # Skip non-serializable objects
-                if k in ['VisionModel', 'LanguageModel', 'TextTokenizer', 'criterion', 'vision_config', 'text_config']:
-                    continue
-                serializable_dict[k] = v
-        return json.dumps(serializable_dict, indent=2)
 
 class MultiModalProjector(nn.Module):
     def __init__(self, config: VLMConfig):
@@ -165,9 +152,11 @@ class MultiModalProjector(nn.Module):
         return hidden_states
 
 #----------------- MAIN CLASS -----------------#
-class VLM(nn.Module):
+class VLM(PreTrainedModel):
+    config_class = VLMConfig
+
     def __init__(self, config: VLMConfig):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         # create an instance of the vision encoder
         self.VisionModel = config.VisionModel
@@ -179,6 +168,24 @@ class VLM(nn.Module):
         # set the padding token
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
         self.gradient_checkpointing = config.gradient_checkpointing
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        # If we have past_key_values, only use the last token
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+        
+        # Prepare the inputs dict
+        model_inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
+            "pixel_values": kwargs.get("pixel_values", None),
+            "use_cache": kwargs.get("use_cache", True),
+        }
+        
+        return model_inputs
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         self.gradient_checkpointing = True
@@ -395,5 +402,5 @@ def main():
     # response = vlm.generate(input_ids=processed['input_ids'], pixel_values=processed['pixel_values'], attention_mask=processed['attention_mask'])
     # print(response)
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()
